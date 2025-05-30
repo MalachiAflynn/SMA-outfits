@@ -81,19 +81,32 @@ class SMACryptoEnhanced(IStrategy):
 
     # Minimal ROI - optimizing the target for 0 minutes
     # Other ROI points can be kept static or also made optimizable
-    roi_p0 = DecimalParameter(0.01, 0.10, default=0.04, decimals=3, space="roi", optimize=True, load=True)
-    # roi_p30 = DecimalParameter(0.01, 0.05, default=0.02, space="roi", optimize=True, load=True)
-    # roi_p60 = DecimalParameter(0.005, 0.02, default=0.01, space="roi", optimize=True, load=True)
+    roi_time0_profit = DecimalParameter(low=0.01, high=0.10, default=0.04, decimals=3, space="roi", optimize=True, load=True)
+
+    # Second ROI point (optimizable time and profit)
+    roi_time1_minutes = IntParameter(low=15, high=120, default=30, step=15, space="roi", optimize=True, load=True)
+    roi_time1_profit = DecimalParameter(low=0.005, high=0.05, default=0.02, decimals=3, space="roi", optimize=True, load=True)
 
     # ATR Trailing Stop Multiplier
     tsl_atr_multiplier = DecimalParameter(low=1.0, high=5.0, default=2.0, decimals=1, space="protection", optimize=True, load=True)
+    # ATR Period for Trailing Stop
+    tsl_atr_period = IntParameter(low=7, high=28, default=14, space="protection", optimize=True, load=True)
 
     @property
     def minimal_roi(self):
+        # Freqtrade expects keys to be integers (minutes).
+        # The dictionary items are processed by Freqtrade to determine the ROI behavior.
+        # It's important that time_ H.W. Bush, George H.W. Bush, George H. W. Bush, G. H. W. Bush, Bush Sr., Bush 41, Bush the Elder, George Herbert Walker Bushvalues are unique and sorted, which dict literals do by insertion order for Python 3.7+
+        # Freqtrade typically handles sorting of these times internally if needed.
+
+        # Ensure the time for the third static point is distinct and later than the optimized second point
+        # A simple way is to add a fixed duration to the optimized time of the second point.
+        time_for_third_point = self.roi_time1_minutes.value + 120
+
         return {
-            "0": self.roi_p0.value,
-            "30": 0.02, # Static for now, or use self.roi_p30.value if defined
-            "60": 0.01  # Static for now, or use self.roi_p60.value if defined
+            0: self.roi_time0_profit.value,
+            self.roi_time1_minutes.value: self.roi_time1_profit.value,
+            time_for_third_point: 0.001 # Static minimal profit target long after the second point
         }
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -114,7 +127,7 @@ class SMACryptoEnhanced(IStrategy):
 
         # --- ATR (Average True Range - Wilder's Smoothing by default in TA-Lib) ---
         # TALIB's ATR needs high, low, close.
-        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14) # Default ATR period for signals, TSL might use this or another
+        dataframe['atr'] = ta.ATR(dataframe, timeperiod=self.tsl_atr_period.value)
 
         return dataframe
 
