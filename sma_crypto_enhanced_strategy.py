@@ -1,6 +1,8 @@
 # --- Do not remove these libs ---
 from freqtrade.strategy import IStrategy, IntParameter, DecimalParameter, CategoricalParameter
 from pandas import DataFrame
+from datetime import datetime
+from freqtrade.persistence import Trade # For type hinting Trade object
 # --------------------------------
 
 # Add your lib to import here
@@ -24,11 +26,11 @@ class SMACryptoEnhanced(IStrategy):
 
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
-    minimal_roi = {
-        "60": 0.01,  # 1% profit after 60 minutes
-        "30": 0.02,  # 2% profit after 30 minutes
-        "0": 0.04    # 4% profit immediately
-    }
+    # minimal_roi = {
+    #     "60": 0.01,  # 1% profit after 60 minutes
+    #     "30": 0.02,  # 2% profit after 30 minutes
+    #     "0": 0.04    # 4% profit immediately
+    # }
 
     # Optimal timeframe for the strategy.
     startup_candle_count: int = 200  # Based on the longest SMA (200 periods)
@@ -61,38 +63,113 @@ class SMACryptoEnhanced(IStrategy):
     }
 
     # --- Strategy parameters for Hyperopt ---
-    # These are examples if we want to enable Hyperopt later
-    # buy_rsi = IntParameter(low=30, high=50, default=35, space="buy")
-    # sell_rsi = IntParameter(low=50, high=70, default=65, space="sell")
+    # SMA Periods
+    sma_short_period = IntParameter(low=5, high=25, default=10, space="buy", optimize=True, load=True)
+    sma_medium_period = IntParameter(low=30, high=70, default=50, space="buy", optimize=True, load=True)
+    # sma_long_period is fixed at 200
 
+    # RSI Parameters
+    rsi_period = IntParameter(low=10, high=25, default=14, space="buy", optimize=True, load=True)
+    rsi_buy_level = IntParameter(low=40, high=60, default=50, space="buy", optimize=True, load=True)
+    rsi_sell_level = IntParameter(low=40, high=60, default=50, space="sell", optimize=True, load=True) # For exit condition
+
+    # OBV SMA Period
+    obv_sma_period = IntParameter(low=10, high=30, default=20, space="buy", optimize=True, load=True)
+
+    # Stoploss Percentage (Freqtrade will use this class attribute 'stoploss' if it's a Parameter)
+    stoploss = DecimalParameter(-0.20, -0.01, default=-0.10, decimals=2, space="sell", optimize=True, load=True)
+
+    # Minimal ROI - optimizing the target for 0 minutes
+    # Other ROI points can be kept static or also made optimizable
+    roi_p0 = DecimalParameter(0.01, 0.10, default=0.04, decimals=3, space="roi", optimize=True, load=True)
+    # roi_p30 = DecimalParameter(0.01, 0.05, default=0.02, space="roi", optimize=True, load=True)
+    # roi_p60 = DecimalParameter(0.005, 0.02, default=0.01, space="roi", optimize=True, load=True)
+
+    # ATR Trailing Stop Multiplier
+    tsl_atr_multiplier = DecimalParameter(low=1.0, high=5.0, default=2.0, decimals=1, space="protection", optimize=True, load=True)
+
+    @property
+    def minimal_roi(self):
+        return {
+            "0": self.roi_p0.value,
+            "30": 0.02, # Static for now, or use self.roi_p30.value if defined
+            "60": 0.01  # Static for now, or use self.roi_p60.value if defined
+        }
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        '''
-        Adds several different TA indicators to the given DataFrame
-
-        Performance Note: For the best performance be frugal on the number of indicators
-        you are using. Let uncomment only the indicator you are using in your strategies
-        or your hyperopt configuration, otherwise you will waste your memory and CPU usage.
-        '''
+        """
+        Adds several different TA indicators to the given DataFrame using hyperoptable parameters.
+        """
         # --- SMAs ---
-        dataframe['sma_short'] = ta.SMA(dataframe, timeperiod=10)
-        dataframe['sma_medium'] = ta.SMA(dataframe, timeperiod=50)
-        dataframe['sma_long'] = ta.SMA(dataframe, timeperiod=200)
+        dataframe['sma_short'] = ta.SMA(dataframe, timeperiod=self.sma_short_period.value)
+        dataframe['sma_medium'] = ta.SMA(dataframe, timeperiod=self.sma_medium_period.value)
+        dataframe['sma_long'] = ta.SMA(dataframe, timeperiod=200) # Fixed long SMA
 
         # --- RSI ---
-        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=self.rsi_period.value)
 
         # --- OBV (On-Balance Volume) ---
-        # TALIB's OBV uses close and volume. Ensure 'volume' column is present and float.
-        # Freqtrade DataFrames typically have 'volume' as float.
         dataframe['obv'] = ta.OBV(dataframe['close'], dataframe['volume'])
-        dataframe['obv_sma'] = ta.SMA(dataframe['obv'], timeperiod=20)
+        dataframe['obv_sma'] = ta.SMA(dataframe['obv'], timeperiod=self.obv_sma_period.value)
 
         # --- ATR (Average True Range - Wilder's Smoothing by default in TA-Lib) ---
         # TALIB's ATR needs high, low, close.
-        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14)
+        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14) # Default ATR period for signals, TSL might use this or another
 
         return dataframe
+
+    def custom_stoploss(self, pair: str, trade: 'Trade', current_time: 'datetime',
+                        current_rate: float, current_profit: float, **kwargs) -> float:
+        '''
+        Custom stoploss logic, implementing an ATR-based trailing stop.
+        This method is called by Freqtrade for open trades each tick.
+        :param pair: Pair that's currently open (e.g. 'BTC/USDT')
+        :param trade: Trade object. Attributes like `trade.open_rate`, `trade.is_short`,
+                      `trade.stop_loss_pct` (initial stoploss percentage),
+                      `trade.stop_loss` (current absolute stop price).
+        :param current_time: datetime object, current candle datetime
+        :param current_rate: Current rate for pair
+        :param current_profit: Current profit (as ratio, e.g. 0.01 for 1%)
+        :return: New absolute stop-loss price. Returning -1 leaves stoploss untouched.
+                 A positive value sets the new absolute stoploss.
+        '''
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe.empty:
+            return -1 # Data not found, leave stoploss untouched
+
+        # Ensure 'atr' column exists
+        if 'atr' not in dataframe.columns:
+            # This might happen if populate_indicators hasn't run or 'atr' was dropped
+            return -1
+
+        last_candle_atr = dataframe['atr'].iloc[-1]
+
+        # Ensure last_candle_atr is a valid number, otherwise, don't update stop
+        if not isinstance(last_candle_atr, (float, int)) or last_candle_atr <= 0 or np.isnan(last_candle_atr):
+            return -1 # Keep current stop_loss price
+
+        atr_val = last_candle_atr * self.tsl_atr_multiplier.value
+
+        # trade.stop_loss should hold the current absolute stop price set by Freqtrade
+        # (either from initial stoploss or previous custom_stoploss calls)
+        current_stop_price = trade.stop_loss
+
+        if trade.is_short:
+            new_potential_stop = current_rate + atr_val
+            # For short, stop moves down. We want the lower of current stop and new potential stop.
+            # (min ensures it doesn't move against us, only trails or stays)
+            if current_stop_price is not None:
+                return min(current_stop_price, new_potential_stop)
+            else: # Should not happen if initial stoploss is set
+                return new_potential_stop
+        else: # Long trade
+            new_potential_stop = current_rate - atr_val
+            # For long, stop moves up. We want the higher of current stop and new potential stop.
+            # (max ensures it doesn't move against us, only trails or stays)
+            if current_stop_price is not None:
+                return max(current_stop_price, new_potential_stop)
+            else: # Should not happen if initial stoploss is set
+                return new_potential_stop
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -120,7 +197,7 @@ class SMACryptoEnhanced(IStrategy):
         conditions_long = (
             (qtpylib.crossed_above(dataframe['sma_short'], dataframe['sma_medium'])) &
             (dataframe['close'] > dataframe['sma_long']) &
-            (dataframe['rsi'] > 50) &
+            (dataframe['rsi'] > self.rsi_buy_level.value) &
             (dataframe['obv'] > dataframe['obv_sma']) &
             (dataframe['volume'] > 0)  # Ensure there is trading volume
         )
@@ -156,7 +233,7 @@ class SMACryptoEnhanced(IStrategy):
         # Define conditions for long exit
         conditions_exit_long = (
             (qtpylib.crossed_below(dataframe['sma_short'], dataframe['sma_medium'])) &
-            (dataframe['rsi'] < 50) &
+            (dataframe['rsi'] < self.rsi_sell_level.value) &
             (dataframe['obv'] < dataframe['obv_sma']) &
             (dataframe['volume'] > 0)  # Ensure there is trading volume
         )
