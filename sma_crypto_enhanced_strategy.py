@@ -8,6 +8,7 @@ from freqtrade.persistence import Trade # For type hinting Trade object
 # Add your lib to import here
 import talib.abstract as ta
 import freqtrade.vendor.qtpylib.indicators as qtpylib
+import pandas_ta as pta
 
 class SMACryptoEnhanced(IStrategy):
     '''
@@ -58,8 +59,26 @@ class SMACryptoEnhanced(IStrategy):
             "OBV": {
                 'obv': {'color': 'green'},
                 'obv_sma': {'color': 'darkgreen'},
+            },
+            "VWAP": {
+                'vwap': {'color': 'cyan', 'linestyle': '-.'}
+            },
+            "ADX": {
+                'adx': {'color': 'purple'},
+            },
+            "BBW": {
+                'bb_width': {'color': 'darkcyan'},
             }
-        }
+        },
+        'main_plot': {
+            'sma_short': {'color': 'blue'},
+            'sma_medium': {'color': 'orange'},
+            'sma_long': {'color': 'purple'},
+            'vwap': {'color': 'teal', 'linestyle': ':'},
+            'bb_upperband': {'color': 'lightslategray', 'linestyle': '--'},
+            'bb_lowerband': {'color': 'lightslategray', 'linestyle': '--'},
+            'bb_middleband': {'color': 'gray', 'linestyle': '-.'},
+        },
     }
 
     # --- Strategy parameters for Hyperopt ---
@@ -91,6 +110,12 @@ class SMACryptoEnhanced(IStrategy):
     tsl_atr_multiplier = DecimalParameter(low=1.0, high=5.0, default=2.0, decimals=1, space="protection", optimize=True, load=True)
     # ATR Period for Trailing Stop
     tsl_atr_period = IntParameter(low=7, high=28, default=14, space="protection", optimize=True, load=True)
+
+    # ADX Trend Confirmation Level
+    adx_trend_confirm_level = IntParameter(low=15, high=40, default=25, step=1, space="buy", optimize=True, load=True)
+
+    # Bollinger Band Width Minimum Confirmation Level
+    bb_width_trend_confirm_min = DecimalParameter(low=0.01, high=0.25, default=0.03, decimals=3, space="buy", optimize=True, load=True)
 
     @property
     def minimal_roi(self):
@@ -128,6 +153,33 @@ class SMACryptoEnhanced(IStrategy):
         # --- ATR (Average True Range - Wilder's Smoothing by default in TA-Lib) ---
         # TALIB's ATR needs high, low, close.
         dataframe['atr'] = ta.ATR(dataframe, timeperiod=self.tsl_atr_period.value)
+
+        # --- VWAP (Volume Weighted Average Price) ---
+        # pandas-ta calculates VWAP. It might reset daily or be continuous depending on usage/library version.
+        # For typical intraday strategies, a daily resetting VWAP is often used.
+        # If 'anchor' parameter is available and needed: pta.vwap(..., anchor="D") for daily.
+        # Default pta.vwap is typically a running VWAP.
+        dataframe['vwap'] = pta.vwap(high=dataframe['high'],
+                                     low=dataframe['low'],
+                                     close=dataframe['close'],
+                                     volume=dataframe['volume'])
+
+        # --- ADX (Average Directional Index) ---
+        dataframe['adx'] = ta.ADX(dataframe, timeperiod=14) # Default period is 14
+
+        # --- Bollinger Bands ---
+        bollinger = ta.BBANDS(dataframe, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0) # matype=0 for SMA
+        dataframe['bb_lowerband'] = bollinger['lowerband']
+        dataframe['bb_middleband'] = bollinger['middleband'] # Effectively SMA20
+        dataframe['bb_upperband'] = bollinger['upperband']
+
+        # --- Bollinger Band Width (BBW) ---
+        # Handle potential division by zero if bb_middleband is 0 (though unlikely for close prices)
+        dataframe['bb_width'] = np.where(
+            dataframe['bb_middleband'] == 0,
+            0,
+            (dataframe['bb_upperband'] - dataframe['bb_lowerband']) / dataframe['bb_middleband']
+        )
 
         return dataframe
 
@@ -210,13 +262,16 @@ class SMACryptoEnhanced(IStrategy):
         conditions_long = (
             (qtpylib.crossed_above(dataframe['sma_short'], dataframe['sma_medium'])) &
             (dataframe['close'] > dataframe['sma_long']) &
+            (dataframe['close'] > dataframe['vwap']) &      # VWAP filter
             (dataframe['rsi'] > self.rsi_buy_level.value) &
             (dataframe['obv'] > dataframe['obv_sma']) &
+            (dataframe['adx'] > self.adx_trend_confirm_level.value) & # ADX trend strength
+            (dataframe['bb_width'] > self.bb_width_trend_confirm_min.value) & # Min BB width
             (dataframe['volume'] > 0)  # Ensure there is trading volume
         )
 
         # Apply conditions to set 'enter_long' and 'enter_tag'
-        dataframe.loc[conditions_long, ['enter_long', 'enter_tag']] = (1, 'golden_cross_enhanced')
+        dataframe.loc[conditions_long, ['enter_long', 'enter_tag']] = (1, 'golden_cross_regime_filtered') # Updated tag
 
         return dataframe
 
@@ -248,6 +303,7 @@ class SMACryptoEnhanced(IStrategy):
             (qtpylib.crossed_below(dataframe['sma_short'], dataframe['sma_medium'])) &
             (dataframe['rsi'] < self.rsi_sell_level.value) &
             (dataframe['obv'] < dataframe['obv_sma']) &
+            (dataframe['close'] < dataframe['vwap']) & # VWAP filter
             (dataframe['volume'] > 0)  # Ensure there is trading volume
         )
 
@@ -286,7 +342,10 @@ if __name__ == '__main__':
 
     print("\n--- Checking for NaNs in last few rows of added indicators ---")
     last_rows = df_with_indicators.tail()
-    indicator_cols = ['sma_short', 'sma_medium', 'sma_long', 'rsi', 'obv', 'obv_sma', 'atr']
+    indicator_cols = [
+        'sma_short', 'sma_medium', 'sma_long', 'rsi', 'obv', 'obv_sma', 'atr', 'vwap',
+        'adx', 'bb_lowerband', 'bb_middleband', 'bb_upperband', 'bb_width'
+    ]
     for col in indicator_cols:
         if col in last_rows:
             print(f"'{col}' last 5 values: {last_rows[col].values}")
